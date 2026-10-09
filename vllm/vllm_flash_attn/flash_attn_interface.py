@@ -4,6 +4,10 @@
 # ruff: noqa: E501
 
 
+import functools
+import os
+import sys
+
 import torch
 
 # isort: off
@@ -78,10 +82,12 @@ def _is_fa4_supported() -> tuple[bool, str | None]:
         current_platform.is_device_capability_family(90)
         or current_platform.is_device_capability_family(100)
         or current_platform.is_device_capability_family(110)
+        or current_platform.is_device_capability_family(120)
     ):
         return (
             False,
-            "FA4 is only supported on devices with compute capability 9.x, 10.x, or 11.x",
+            "FA4 is only supported on devices with compute capability 9.x, 10.x, "
+            "11.x, or 12.x",
         )
     return True, None
 
@@ -171,6 +177,99 @@ def get_scheduler_metadata(
     )
 
     return scheduler_metadata
+
+
+@functools.lru_cache(maxsize=1)
+def _load_fa4_sm120_bundle():
+    """Load the standalone flash-attn-4 SM120 bundle package.
+
+    The bundle ports the unmerged Dao-AILab SM120 PRs (paged KV, TMA fwd,
+    split-KV) that the in-tree CuTe kernels do not have on SM120.
+    """
+    import importlib.util
+
+    root = os.environ.get("VLLM_FA4_SM120_DIR", "/home/danielk/code/fa4_sm120")
+    name = os.path.basename(os.path.normpath(root)) + "_bundle"
+    init = os.path.join(root, "__init__.py")
+    if not os.path.exists(init):
+        raise ImportError(
+            f"FA4 SM120 bundle not found at {root!r} "
+            "(set VLLM_FA4_SM120_DIR to the bundle root)"
+        )
+    spec = importlib.util.spec_from_file_location(
+        name, init, submodule_search_locations=[root]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fa4_sm120_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    page_table: torch.Tensor | None,
+    softmax_scale: float | None,
+    causal: bool,
+    softcap: float | None,
+    window_size: tuple[int, int],
+    num_splits: int,
+    return_softmax_lse: bool,
+    out: torch.Tensor | None,
+    learnable_sink: torch.Tensor | None,
+    mask_mod,
+    block_sparse_tensors,
+    aux_tensors,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """SM120 FA4 forward: delegate to the standalone FA4 SM120 bundle."""
+    assert k.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2), (
+        "FA4 SM120 bundle does not support FP8 KV cache yet"
+    )
+    assert mask_mod is None, "mask_mod not supported by the FA4 SM120 bundle"
+    assert block_sparse_tensors is None, (
+        "block_sparse_tensors not supported by the FA4 SM120 bundle"
+    )
+    assert aux_tensors is None, (
+        "aux_tensors not supported by the FA4 SM120 bundle"
+    )
+    assert page_table is not None or seqused_k is None, (
+        "Paged KV on SM120 requires seqused_k"
+    )
+    bundle = _load_fa4_sm120_bundle()
+    res = bundle.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap or 0.0,
+        window_size=tuple(
+            w if w is not None and w >= 0 else None for w in window_size  # type: ignore[operator]
+        ),
+        num_splits=max(num_splits, 1),
+        learnable_sink=learnable_sink,
+        return_lse=return_softmax_lse,
+    )
+    bundle_out, bundle_lse = res
+    if not return_softmax_lse:
+        bundle_lse = None
+    if out is not None:
+        out.copy_(bundle_out)
+        bundle_out = out
+    return bundle_out, bundle_lse
 
 
 def flash_attn_varlen_func(
@@ -431,6 +530,33 @@ def flash_attn_varlen_func(
         # initialize these tensors even when the inputs are not quantized.
         if v.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
             q_descale = k_descale = v_descale = None
+
+        # SM120 (compute capability 12.x): the in-tree CuTe kernels lack paged KV
+        # support on SM120, so delegate to the standalone FA4 SM120 bundle.
+        if torch.cuda.get_device_capability()[0] == 12:
+            out, softmax_lse = _fa4_sm120_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                page_table=block_table,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                softcap=softcap,
+                window_size=real_window_size,
+                num_splits=num_splits,
+                return_softmax_lse=return_softmax_lse,
+                out=out,
+                learnable_sink=s_aux,
+                mask_mod=mask_mod,
+                block_sparse_tensors=block_sparse_tensors,
+                aux_tensors=aux_tensors,
+            )
+            return (out, softmax_lse) if return_softmax_lse else out
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
