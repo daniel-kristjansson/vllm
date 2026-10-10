@@ -18,7 +18,7 @@ Key benefits:
 
 ## Sleep levels
 
-Level 1 sleep will offload the model weights and discard the KV cache. The content of KV cache is forgotten. Level 1 sleep is good for sleeping and waking up the engine to run the same model again. The model weights are backed up in CPU memory. Please make sure there's enough CPU memory to store the model weights. Level 2 sleep will discard both the model weights and the KV cache (while the model's buffers are kept in CPU, like rope scaling tensors). The content of both the model weights and KV cache is forgotten. Level 2 sleep is good for sleeping and waking up the engine to run a different model or update the model, where previous model weights are not needed, e.g. RLHF weight update. Level 2 sleep is also useful when there is not enough CPU memory to back up the model weights, e.g. when a colocated trainer already uses CPU memory for offloading its own state; since nothing is backed up, restore the weights after waking up with `collective_rpc("reload_weights")`.
+Level 1 sleep will offload the model weights and discard the KV cache. The content of KV cache is forgotten. Level 1 sleep is good for sleeping and waking up the engine to run the same model again. The model weights are backed up in pageable (swappable) CPU memory. Please make sure there's enough CPU memory to store the model weights; if it is swapped out, waking up is slower while the pages are read back. Level 2 sleep will discard both the model weights and the KV cache (while the model's buffers are kept in CPU, like rope scaling tensors). The content of both the model weights and KV cache is forgotten. Level 2 sleep is good for sleeping and waking up the engine to run a different model or update the model, where previous model weights are not needed, e.g. RLHF weight update. Level 2 sleep is also useful when there is not enough CPU memory to back up the model weights, e.g. when a colocated trainer already uses CPU memory for offloading its own state; since nothing is backed up, restore the weights after waking up with `collective_rpc("reload_weights")`.
 
 ## Usage
 
@@ -115,7 +115,7 @@ llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, sleep_mode_offload_cudagraph=
 
 or `vllm serve <model> --enable-sleep-mode --sleep-mode-offload-cudagraph`.
 
-The cost is pinned host memory for the pool's backup, also at level 2, and one
+The cost is host memory for the pool's backup (pageable like the weights backup, so it can be swapped out), also at level 2, and one
 extra copy per captured custom allreduce (about 3% decode latency at batch
 size 1). `NCCL_GRAPH_REGISTER` defaults to `0`, since NCCL graph registration
 would pin the pool; an explicit value is kept with a warning. Graph executables

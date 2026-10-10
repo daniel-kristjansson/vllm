@@ -27,7 +27,6 @@ from vllm.device_allocator.alloc_conf import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import find_loaded_library
-from vllm.utils.torch_utils import PIN_MEMORY
 
 logger = init_logger(__name__)
 
@@ -265,11 +264,12 @@ class CuMemAllocator:
             if data.tag in offload_tags:
                 backup_bytes += handle[1]
                 size_in_bytes = handle[1]
+                # Pageable (unpinned) host memory: the backup is swappable
+                # under memory pressure, unlike pinned memory.
                 cpu_backup_tensor = torch.empty(
                     size_in_bytes,
                     dtype=torch.uint8,
                     device="cpu",
-                    pin_memory=PIN_MEMORY,
                 )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
