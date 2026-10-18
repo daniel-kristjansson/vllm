@@ -1316,6 +1316,35 @@ class SpecDecodeBaseProposer:
             )
         return model
 
+    def reload_weights(self) -> None:
+        """Reload the draft model weights in place from the draft checkpoint.
+
+        Required after a level-2 sleep/wake cycle: level-2 sleep discards
+        the draft weights (only buffers are backed up to CPU by
+        gpu_worker.sleep) and the target model's load_weights does not
+        cover the draft model (vllm-project/vllm#52479).
+        """
+        if self.model is None:
+            return
+
+        from vllm.model_executor.model_loader import get_model_loader
+
+        draft_vllm_config = self._create_draft_vllm_config()
+        load_config = get_draft_load_config(draft_vllm_config)
+        model_loader = get_model_loader(load_config)
+        if not hasattr(model_loader, "get_all_weights"):
+            raise NotImplementedError(
+                f"Draft model reloading with `{load_config.load_format}` format"
+            )
+
+        draft_model_config = self.speculative_config.draft_model_config
+        logger.info(
+            "Reloading draft model weights in place from %s ...",
+            draft_model_config.model,
+        )
+        weights = model_loader.get_all_weights(draft_model_config, self.model)
+        self.model.load_weights(weights)
+
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
