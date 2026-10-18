@@ -535,10 +535,14 @@ class DFlashQwen3Model(nn.Module):
         ):
             # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
             kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-            self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
+            self._fused_kv_weight: torch.Tensor | None = self._adopt_fused_tensor(
+                "_fused_kv_weight", torch.cat(kv_weights, dim=0)
+            )
             if has_bias:
                 kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-                self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+                self._fused_kv_bias: torch.Tensor | None = self._adopt_fused_tensor(
+                    "_fused_kv_bias", torch.cat(kv_biases, dim=0)
+                )
             else:
                 self._fused_kv_bias = None
         else:
@@ -549,9 +553,36 @@ class DFlashQwen3Model(nn.Module):
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        self._k_norm_weights = self._adopt_fused_tensor(
+            "_k_norm_weights",
+            torch.stack(
+                [a.k_norm.weight.data for a in layers_attn], dim=0
+            ).contiguous(),
+        )
+
+    def _adopt_fused_tensor(self, attr: str, value: torch.Tensor) -> torch.Tensor:
+        """Adopt ``value`` into the existing buffer when one is already held.
+
+        These fused buffers are read through addresses that get baked into
+        captured CUDA graphs: ``precompute_and_store_context_kv`` (which
+        consumes ``_fused_kv_weight`` / ``_k_norm_weights``) is captured ahead
+        of the draft query forward. Re-allocating them on a rebuild -- e.g.
+        the ``load_weights`` run after a level-2 sleep/wake reload -- would
+        leave the captured graph reading the old (freed/zeroed) storage even
+        though the new tensor holds the correct values. Copying in place
+        keeps the addresses stable across rebuilds.
+        """
+        old = getattr(self, attr, None)
+        if (
+            isinstance(old, torch.Tensor)
+            and old.shape == value.shape
+            and old.dtype == value.dtype
+            and old.device == value.device
+        ):
+            old.copy_(value)
+            return old
+        setattr(self, attr, value)
+        return value
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
