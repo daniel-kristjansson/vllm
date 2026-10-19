@@ -179,22 +179,64 @@ def get_scheduler_metadata(
     return scheduler_metadata
 
 
+# Checkout of the vendored FA4 SM120 tree (branch `vendor-sm120`): Dao-AILab main
+# plus the unmerged SM120 paged-KV / SplitKV / TMA / block-sparse PRs and the
+# local SM120 fixes, rebased onto this fork's base.
+VENDOR_SM120_FA4_ROOT = "/home/danielk/code/flash-attention-sm120"
+
+
 @functools.lru_cache(maxsize=1)
 def _load_fa4_sm120_bundle():
-    """Load the standalone flash-attn-4 SM120 bundle package.
+    """Load the vendored flash-attn-4 SM120 package.
 
-    The bundle ports the unmerged Dao-AILab SM120 PRs (paged KV, TMA fwd,
-    split-KV) that the in-tree CuTe kernels do not have on SM120.
+    Returns the module that exposes ``flash_attn_func`` / ``flash_attn_varlen_func``
+    for SM120. ``VLLM_FA4_SM120_DIR`` overrides the checkout: it may point at the
+    repo root, at ``flash_attn/cute``, or at a flat standalone bundle root whose
+    ``__init__.py`` is the package (the pre-vendor layout).
     """
+    import importlib
     import importlib.util
+    import types
 
-    root = os.environ.get("VLLM_FA4_SM120_DIR", "/home/danielk/code/fa4_sm120")
+    root = os.path.abspath(
+        os.environ.get("VLLM_FA4_SM120_DIR", VENDOR_SM120_FA4_ROOT)
+    )
+    repo_root = root
+    if (
+        os.path.basename(root) == "cute"
+        and os.path.basename(os.path.dirname(root)) == "flash_attn"
+    ):
+        repo_root = os.path.dirname(os.path.dirname(root))
+
+    package_dir = os.path.join(repo_root, "flash_attn")
+    if os.path.exists(os.path.join(package_dir, "cute", "__init__.py")):
+        # The CuTe package imports itself as `flash_attn.cute.*`, and
+        # `flash_attn/__init__.py` pulls the FA2 CUDA extension, which the SM120
+        # vendored tree does not build. Install a namespace stub for the parent
+        # package so the submodule imports resolve against this checkout.
+        existing = sys.modules.get("flash_attn")
+        if existing is None or not any(
+            os.path.abspath(path).startswith(package_dir)
+            for path in list(getattr(existing, "__path__", []))
+        ):
+            stub = types.ModuleType("flash_attn")
+            stub.__path__ = [package_dir]
+            sys.modules["flash_attn"] = stub
+        module = importlib.import_module("flash_attn.cute")
+        if not os.path.abspath(module.__file__).startswith(package_dir):
+            raise ImportError(
+                f"FA4 SM120 vendor package resolved to {module.__file__!r}, expected "
+                f"a module under {package_dir!r}"
+            )
+        return module
+
+    # Flat standalone bundle (pre-vendor layout): its __init__.py is the package.
     name = os.path.basename(os.path.normpath(root)) + "_bundle"
     init = os.path.join(root, "__init__.py")
     if not os.path.exists(init):
         raise ImportError(
-            f"FA4 SM120 bundle not found at {root!r} "
-            "(set VLLM_FA4_SM120_DIR to the bundle root)"
+            f"FA4 SM120 package not found at {root!r} (set VLLM_FA4_SM120_DIR to "
+            f"{VENDOR_SM120_FA4_ROOT}, or to a flash_attn/cute directory)"
         )
     spec = importlib.util.spec_from_file_location(
         name, init, submodule_search_locations=[root]
