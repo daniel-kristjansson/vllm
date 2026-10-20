@@ -28,6 +28,12 @@ endif()
 if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
+# Also accept it as a CMake cache argument. Python build frontends may not
+# preserve environment variables consistently when launching nested CMake.
+if (DEFINED VLLM_FLASH_ATTN_SRC_DIR)
+  set(VLLM_FLASH_ATTN_SRC_DIR ${VLLM_FLASH_ATTN_SRC_DIR} CACHE PATH
+      "Local vllm-flash-attn source tree" FORCE)
+endif()
 
 if(VLLM_FLASH_ATTN_SRC_DIR)
   FetchContent_Declare(
@@ -88,29 +94,28 @@ endforeach()
 add_custom_target(_vllm_fa4_cutedsl_C)
 
 # Install flash_attn/cute directory (needed for FA4).
-# When using a local source dir (VLLM_FLASH_ATTN_SRC_DIR), create a symlink
-# so edits to cute-dsl Python files take effect immediately without rebuilding.
-# Otherwise, copy files and transform flash_attn.cute imports to
-# vllm.vllm_flash_attn.cute to match our package structure.
-if(VLLM_FLASH_ATTN_SRC_DIR)
-  install(CODE "
-    set(LINK_TARGET \"${vllm-flash-attn_SOURCE_DIR}/flash_attn/cute\")
-    set(LINK_NAME \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn/cute\")
-    file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn\")
-    file(REMOVE_RECURSE \"\${LINK_NAME}\")
-    file(CREATE_LINK \"\${LINK_TARGET}\" \"\${LINK_NAME}\" SYMBOLIC)
-  " COMPONENT _vllm_fa4_cutedsl_C)
-else()
-  install(CODE "
-    file(GLOB_RECURSE CUTE_PY_FILES \"${vllm-flash-attn_SOURCE_DIR}/flash_attn/cute/*.py\")
-    foreach(SRC_FILE \${CUTE_PY_FILES})
-      file(RELATIVE_PATH REL_PATH \"${vllm-flash-attn_SOURCE_DIR}/flash_attn/cute\" \${SRC_FILE})
-      set(DST_FILE \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn/cute/\${REL_PATH}\")
-      get_filename_component(DST_DIR \${DST_FILE} DIRECTORY)
-      file(MAKE_DIRECTORY \${DST_DIR})
-      file(READ \${SRC_FILE} FILE_CONTENTS)
-      string(REPLACE \"flash_attn.cute\" \"vllm.vllm_flash_attn.cute\" FILE_CONTENTS \"\${FILE_CONTENTS}\")
-      file(WRITE \${DST_FILE} \"\${FILE_CONTENTS}\")
-    endforeach()
-  " COMPONENT _vllm_fa4_cutedsl_C)
+#
+# The CuTe sources import themselves as `flash_attn.cute.*`, but vLLM ships them
+# as `vllm.vllm_flash_attn.cute`, so the imports must be rewritten on install.
+# This applies to both the pinned-upstream and the local-source
+# (VLLM_FLASH_ATTN_SRC_DIR) case: symlinking a local tree instead of copying it
+# left `flash_attn.cute` imports inside the vllm package, which cannot import.
+set(_VLLM_FA4_CUTE_SRC "${vllm-flash-attn_SOURCE_DIR}/flash_attn/cute")
+if(NOT EXISTS "${_VLLM_FA4_CUTE_SRC}/interface.py")
+  message(FATAL_ERROR
+    "flash_attn/cute not found under '${vllm-flash-attn_SOURCE_DIR}'. "
+    "Set VLLM_FLASH_ATTN_SRC_DIR to a flash-attention checkout.")
 endif()
+install(CODE "
+  file(GLOB_RECURSE CUTE_PY_FILES \"${_VLLM_FA4_CUTE_SRC}/*.py\")
+  file(REMOVE_RECURSE \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn/cute\")
+  foreach(SRC_FILE \${CUTE_PY_FILES})
+    file(RELATIVE_PATH REL_PATH \"${_VLLM_FA4_CUTE_SRC}\" \${SRC_FILE})
+    set(DST_FILE \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn/cute/\${REL_PATH}\")
+    get_filename_component(DST_DIR \${DST_FILE} DIRECTORY)
+    file(MAKE_DIRECTORY \${DST_DIR})
+    file(READ \${SRC_FILE} FILE_CONTENTS)
+    string(REPLACE \"flash_attn.cute\" \"vllm.vllm_flash_attn.cute\" FILE_CONTENTS \"\${FILE_CONTENTS}\")
+    file(WRITE \${DST_FILE} \"\${FILE_CONTENTS}\")
+  endforeach()
+" COMPONENT _vllm_fa4_cutedsl_C)
