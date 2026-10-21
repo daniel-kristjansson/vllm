@@ -112,7 +112,14 @@ start_server() {
 
 run_case() {
   local name="$1" attn_cfg="$2" spec="$3"
-  echo "=== $name ($attn_cfg${spec:+, dflash2})"
+  local spec_label=""
+  if [ -n "$spec" ]; then
+    case "$spec" in
+      *dflash*) spec_label=", dflash2" ;;
+      *)        spec_label=", spec" ;;
+    esac
+  fi
+  echo "=== $name ($attn_cfg$spec_label)"
   if ! start_server "$name" "$attn_cfg" "$spec"; then
     stop_server
     return 0
