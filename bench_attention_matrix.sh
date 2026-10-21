@@ -40,9 +40,15 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 mkdir -p "$OUTDIR"
 
+DATASET_NAME="${DATASET_NAME:-code}"
 DATASET="$OUTDIR/prompts.json"
 if [ ! -f "$DATASET" ]; then
-  "$PYTHON" "$REPO_ROOT/make_bench_prompts.py" \
+  case "$DATASET_NAME" in
+    code)  GENERATOR="$REPO_ROOT/make_code_bench_prompts.py" ;;
+    prose) GENERATOR="$REPO_ROOT/make_bench_prompts.py" ;;
+    *) echo "error: DATASET_NAME must be 'code' or 'prose'" >&2; exit 1 ;;
+  esac
+  "$PYTHON" "$GENERATOR" \
     --out "$DATASET" --num-prompts "$NUM_PROMPTS" --output-len "$OUT_LEN"
 fi
 
@@ -68,7 +74,7 @@ stop_server() {
 trap 'stop_server' EXIT
 
 start_server() {
-  local name="$1" fa_version="$2" spec="$3"
+  local name="$1" attn_cfg="$2" spec="$3"
   local log="$OUTDIR/$name.server.log"
   local -a args=(
     serve "$MODEL"
@@ -78,7 +84,7 @@ start_server() {
     --gpu-memory-utilization "$GMEM"
     --max-num-seqs "$MAX_SEQS"
     --seed 0
-    --attention-config "{\"backend\": \"FLASH_ATTN\", \"flash_attn_version\": $fa_version}"
+    --attention-config "$attn_cfg"
   )
   if [ -n "$spec" ]; then
     args+=(--speculative-config "$spec")
@@ -105,9 +111,9 @@ start_server() {
 }
 
 run_case() {
-  local name="$1" fa_version="$2" spec="$3"
-  echo "=== $name (FA$fa_version${spec:+, dflash2})"
-  if ! start_server "$name" "$fa_version" "$spec"; then
+  local name="$1" attn_cfg="$2" spec="$3"
+  echo "=== $name ($attn_cfg${spec:+, dflash2})"
+  if ! start_server "$name" "$attn_cfg" "$spec"; then
     stop_server
     return 0
   fi
@@ -163,7 +169,7 @@ PY
 
 echo "model:       $MODEL"
 echo "draft:       $DRAFT"
-echo "workload:    $NUM_PROMPTS natural-language prompts, $OUT_LEN out tokens"
+echo "workload:    $NUM_PROMPTS $DATASET_NAME prompts, $OUT_LEN out tokens"
 if [ "${SMOKE:-0}" = "1" ]; then
   CONCURRENCY="1"
 fi
@@ -171,10 +177,24 @@ echo "concurrency: $CONCURRENCY"
 echo "outdir:      $OUTDIR"
 echo
 
-run_case fa2-plain    2 ""
-run_case fa2-dflash2  2 "$SPEC_DFLASH"
-run_case fa4-plain    4 ""
-run_case fa4-dflash2  4 "$SPEC_DFLASH"
+FA2_CFG='{"backend": "FLASH_ATTN", "flash_attn_version": 2}'
+FA4_CFG='{"backend": "FLASH_ATTN", "flash_attn_version": 4}'
+TRITON_CFG='{"backend": "TRITON_ATTN"}'
+FI_CFG='{"backend": "FLASHINFER"}'
+
+# Limit the sweep via BACKENDS="fa2 fa4" (default: all four).
+BACKENDS="${BACKENDS:-fa2 fa4 triton flashinfer}"
+for backend in $BACKENDS; do
+  case "$backend" in
+    fa2)        cfg="$FA2_CFG" ;;
+    fa4)        cfg="$FA4_CFG" ;;
+    triton)     cfg="$TRITON_CFG" ;;
+    flashinfer) cfg="$FI_CFG" ;;
+    *) echo "error: unknown BACKENDS entry '$backend'" >&2; exit 1 ;;
+  esac
+  run_case "$backend-plain"   "$cfg" ""
+  run_case "$backend-dflash2" "$cfg" "$SPEC_DFLASH"
+done
 
 echo
 echo "Results in $OUTDIR"
