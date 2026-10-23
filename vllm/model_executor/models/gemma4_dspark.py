@@ -227,19 +227,32 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self, layers_attn: list[nn.Module], has_bias: bool
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
-        self._fused_k_weight = torch.cat([a.k_proj.weight for a in layers_attn], dim=0)
-        self._fused_k_bias: torch.Tensor | None = (
-            torch.cat([a.k_proj.bias for a in layers_attn], dim=0) if has_bias else None
+        self._fused_k_weight = self._adopt_fused_tensor(
+            "_fused_k_weight",
+            torch.cat([a.k_proj.weight for a in layers_attn], dim=0),
         )
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        if has_bias:
+            self._fused_k_bias: torch.Tensor | None = self._adopt_fused_tensor(
+                "_fused_k_bias",
+                torch.cat([a.k_proj.bias for a in layers_attn], dim=0),
+            )
+        else:
+            self._fused_k_bias = None
+        self._k_norm_weights = self._adopt_fused_tensor(
+            "_k_norm_weights",
+            torch.stack(
+                [a.k_norm.weight.data for a in layers_attn], dim=0
+            ).contiguous(),
+        )
         # v_norm has no learnable scale; ones matching the K-norm call shape.
-        self._v_norm_weights = torch.ones(
-            len(layers_attn),
-            layers_attn[0].head_dim,
-            dtype=self._k_norm_weights.dtype,
-            device=self._k_norm_weights.device,
+        self._v_norm_weights = self._adopt_fused_tensor(
+            "_v_norm_weights",
+            torch.ones(
+                len(layers_attn),
+                layers_attn[0].head_dim,
+                dtype=self._k_norm_weights.dtype,
+                device=self._k_norm_weights.device,
+            ),
         )
 
     def _project_context_kv(

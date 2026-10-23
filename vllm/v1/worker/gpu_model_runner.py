@@ -5242,6 +5242,28 @@ class GPUModelRunner(
         self.reset_encoder_cache()
         self.reset_mm_cache()
 
+        # Level-2 sleep discards the speculative draft model's weights too,
+        # and the target model's load_weights above does not cover them
+        # (vllm-project/vllm#52479). Reload the drafter in place as well so
+        # speculation keeps working after a level-2 wake; otherwise every
+        # draft is rejected and decode silently drops to the
+        # no-speculation rate.
+        # The V1 runner holds the drafter as self.drafter; the V2 runner
+        # (gpu/model_runner.py) holds it as self.speculator.
+        drafter = getattr(self, "drafter", None)
+        if drafter is None:
+            drafter = getattr(self, "speculator", None)
+        if drafter is not None:
+            if hasattr(drafter, "reload_weights"):
+                drafter.reload_weights()
+            elif getattr(drafter, "model", None) is not None:
+                # Weight-bearing drafter without a reload hook (ngram and
+                # other stateless drafters have no model and are skipped).
+                logger.warning_once(
+                    "Speculative drafter present but has no reload_weights; "
+                    "draft weights were not restored after reload."
+                )
+
     def _get_prompt_logprobs_dict(
         self,
         hidden_states: torch.Tensor,
