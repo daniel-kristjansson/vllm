@@ -390,6 +390,93 @@ class Worker(WorkerBase):
         digests = compute_tensor_digests(self.model_runner.get_model())
         return {prefix + name: digest for name, digest in digests.items()}
 
+    def compute_sleep_recheck_digests(self) -> dict[str, str]:
+        """Bit-exact digests of target + draft parameters and buffers.
+
+        Used to verify that a level-2 sleep/wake + reload cycle restores
+        the same state a cold load produced (see draft-sleep-reload.patch).
+        """
+        import hashlib
+
+        from vllm.model_executor.model_loader.weight_checksum import _weights
+
+        def _digests(model: nn.Module) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for name, weight in _weights(model):
+                out["p/" + name] = hashlib.sha256(
+                    weight.detach()
+                    .cpu()
+                    .contiguous()
+                    .view(-1)
+                    .view(torch.uint8)
+                    .numpy()
+                ).hexdigest()
+            for name, buffer in model.named_buffers():
+                buf = (
+                    buffer.detach()
+                    .cpu()
+                    .contiguous()
+                    .view(-1)
+                    .view(torch.uint8)
+                    .numpy()
+                )
+                out["b/" + name] = hashlib.sha256(buf).hexdigest()
+            return out
+
+        def _digest(t: torch.Tensor) -> str:
+            return hashlib.sha256(
+                t.detach().cpu().contiguous().view(-1).view(torch.uint8).numpy()
+            ).hexdigest()
+
+        result: dict[str, str] = {}
+        target = self.model_runner.get_model()
+        for name, digest in _digests(target).items():
+            result["target/" + name] = digest
+        # Aux hidden-state layer registration on the target (the drafter's input).
+        aux_layers = getattr(target, "eagle_aux_hidden_state_layers", None)
+        if aux_layers is None:
+            aux_layers = getattr(target, "_aux_hidden_state_layers", None)
+        if aux_layers is not None:
+            result["meta/target_aux_hidden_state_layers"] = str(list(aux_layers))
+
+        draft = self.get_draft_model()
+        if draft is not None:
+            for name, digest in _digests(draft).items():
+                result["draft/" + name] = digest
+            inner = getattr(draft, "model", None)
+            if inner is not None:
+                # Plain tensor attributes (NOT in named_parameters/named_buffers):
+                # rebuilt by load_weights -> _build_fused_kv_buffers(). If these
+                # differ cold vs reloaded, the draft reads stale derived state.
+                for attr in (
+                    "_fused_kv_weight",
+                    "_fused_kv_bias",
+                    "_k_norm_weights",
+                    "_rope_cos_sin_cache",
+                    "_hidden_norm_weight",
+                ):
+                    t = getattr(inner, attr, None)
+                    if isinstance(t, torch.Tensor):
+                        result["draft/f/" + attr] = _digest(t)
+                        result["draft/ptr/" + attr] = hex(t.data_ptr())
+                # KV cache storage addresses (captured in CUDA graphs).
+                try:
+                    for i, layer in enumerate(inner.layers):
+                        kv = layer.self_attn.attn.kv_cache
+                        if isinstance(kv, torch.Tensor):
+                            result[f"draft/ptr/kv_cache.{i}"] = hex(kv.data_ptr())
+                except Exception as exc:  # noqa: BLE001 - diagnostic only
+                    result["meta/draft_kv_cache_error"] = str(exc)
+        for name in ("embed_tokens.weight", "lm_head.weight"):
+            t = None
+            try:
+                t = dict(target.named_parameters()).get(name)
+            except Exception:  # noqa: BLE001
+                t = None
+            if t is not None:
+                result["target/ptr/" + name] = hex(t.data_ptr())
+        return result
+
     def reset_weights(self) -> None:
         zero_weights(self.model_runner.get_model())
 
