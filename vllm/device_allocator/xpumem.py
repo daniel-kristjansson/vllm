@@ -11,6 +11,7 @@ import torch
 
 from vllm.device_allocator import DEFERRABLE_TAGS, AllocationData, HandleType
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import PIN_MEMORY
 
 logger = init_logger(__name__)
 
@@ -193,12 +194,11 @@ class XpuMemAllocator:
 
             backup_bytes += size_in_bytes
             device, _, _, _ = data.handle
-            # Pageable (unpinned) host memory: the backup is swappable
-            # under memory pressure, unlike pinned memory.
             cpu_backup_tensor = torch.empty(
                 size_in_bytes,
                 dtype=torch.uint8,
                 device="cpu",
+                pin_memory=PIN_MEMORY,
             )
             cpu_ptr = cpu_backup_tensor.data_ptr()
             _xpu_memcpy_sync(
