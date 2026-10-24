@@ -379,6 +379,29 @@ class DFlash2BeamModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _adopt_fused_tensor(self, attr: str, value: torch.Tensor) -> torch.Tensor:
+        """Adopt ``value`` into the existing buffer when one is already held.
+
+        These fused context K/V buffers are read through addresses baked into
+        captured CUDA graphs: ``precompute_and_store_context_kv`` is captured
+        ahead of the draft query forward. Re-allocating them on a rebuild --
+        e.g. the ``load_weights`` run after a level-2 sleep/wake reload --
+        would leave the captured graph reading the old freed storage even
+        though the new tensor holds the correct values. Copying in place keeps
+        the addresses stable across rebuilds.
+        """
+        old = getattr(self, attr, None)
+        if (
+            isinstance(old, torch.Tensor)
+            and old.shape == value.shape
+            and old.dtype == value.dtype
+            and old.device == value.device
+        ):
+            old.copy_(value)
+            return old
+        setattr(self, attr, value)
+        return value
+
     def build_context_kv_weights(self) -> None:
         """Stack every layer's K/V projection and K-norm weight.
 
@@ -386,12 +409,14 @@ class DFlash2BeamModel(nn.Module):
         norm. Must run after the weights are loaded, since it copies them.
         """
         attns = [layer.self_attn for layer in self.layers]
-        self._context_kv_weight = torch.cat(
-            [attn.qkv_proj.weight[attn.q_size :] for attn in attns]
+        self._context_kv_weight = self._adopt_fused_tensor(
+            "_context_kv_weight",
+            torch.cat([attn.qkv_proj.weight[attn.q_size :] for attn in attns]),
         )
-        self._context_k_norm_weight = torch.stack(
-            [attn.k_norm.weight for attn in attns]
-        ).contiguous()
+        self._context_k_norm_weight = self._adopt_fused_tensor(
+            "_context_k_norm_weight",
+            torch.stack([attn.k_norm.weight for attn in attns]).contiguous(),
+        )
 
     def precompute_and_store_context_kv(
         self,
