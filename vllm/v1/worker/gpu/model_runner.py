@@ -598,6 +598,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.reset_encoder_cache()
         self.reset_mm_cache()
 
+        # Level-2 sleep discards the speculative draft model's weights too,
+        # and the target model's reload above does not cover them
+        # (vllm-project/vllm#52479). The V2 runner holds the drafter as
+        # self.speculator; its reload_weights hook is defined in
+        # DraftModelSpeculator but was never called, leaving the draft
+        # weights discarded after a level-2 wake.
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None:
+            if hasattr(speculator, "reload_weights"):
+                speculator.reload_weights()
+            elif getattr(speculator, "model", None) is not None:
+                logger.warning_once(
+                    "Speculative speculator present but has no reload_weights; "
+                    "draft weights were not restored after reload."
+                )
+
     @functools.cached_property
     def main_stream(self) -> torch.cuda.Stream:
         # Cache the default CUDA stream to avoid lookup overhead.
