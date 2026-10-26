@@ -230,7 +230,7 @@ def uses_fa4_hd256_kernel(
     if head_size_v is not None and head_size_v != 256:
         return False
     capability = current_platform.get_device_capability()
-    return capability is not None and capability.major in (10, 11)
+    return capability is not None and capability.major in (10, 11, 12)
 
 
 def _fa4_hd256_fallback_reason(

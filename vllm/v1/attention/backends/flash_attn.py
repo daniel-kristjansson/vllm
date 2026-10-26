@@ -172,7 +172,7 @@ class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"
             or 0
         )
         if (
-            major in (10, 11)
+            major in (10, 11, 12)
             and uses_fa4_hd256_kernel(head_dim)
             and page_size == FA4_HD256_PAGE_SIZE
         ):
