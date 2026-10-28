@@ -15,46 +15,52 @@ __all__ = [
     "get_tensor_load_numel",
     "has_device_tensors",
     "get_info_size",
-    "adopt_fused_tensor",
+    "register_fused_buffer",
 ]
 
 
-def adopt_fused_tensor(
-    module: nn.Module, attr: str, value: torch.Tensor
+def register_fused_buffer(
+    module: nn.Module, name: str, value: torch.Tensor
 ) -> torch.Tensor:
-    """Adopt ``value`` into ``module``'s existing ``attr`` tensor when possible.
+    """Store a fused weight buffer as a non-persistent registered buffer.
 
-    Some models stack per-layer weights into fused buffers that are then read
-    through addresses baked into captured CUDA graphs. Those buffers are plain
-    attributes rather than registered buffers, so the layerwise reload path
-    does not preserve their storage. Rebuilding them on a reload re-allocates
-    new tensors and leaves the captured graph reading the old freed storage,
-    even though the reload itself restored the correct values.
+    Drafters stack per-layer weights into fused buffers that are read through
+    addresses baked into captured CUDA graphs. Registering the buffer
+    non-persistently lets the layerwise reload capture and restore its storage,
+    so the address survives a reload and the captured graph keeps reading live
+    memory. Non-persistent keeps it out of the state dict: it is derived from
+    per-layer weights and is not a checkpoint entry.
 
-    When ``attr`` already holds a tensor with matching shape, dtype and device,
-    copy ``value`` into it in place so the address stays stable across rebuilds.
-    A cold load has no prior tensor and adopts ``value`` directly, so first-build
-    behaviour is unchanged; a shape change still re-allocates.
+    Re-registering a name would replace the storage and defeat that purpose, so
+    when ``name`` already holds a materialized tensor of matching shape, dtype
+    and device the values are copied into it in place instead. A cold build has
+    no prior tensor and registers ``value`` directly; a shape change or a
+    meta-derived buffer (seen when the builder runs mid-reload) re-registers.
 
     Args:
-        module: module holding the fused buffer as a plain attribute.
-        attr: name of the attribute to adopt into.
+        module: module that owns the fused buffer.
+        name: buffer name.
         value: freshly built tensor.
 
     Returns:
-        The tensor now held at ``module.attr``.
+        The tensor now registered at ``module.name``.
 
     """
-    old = getattr(module, attr, None)
+    old = module._buffers.get(name)
     if (
         isinstance(old, torch.Tensor)
+        and not old.is_meta
         and old.shape == value.shape
         and old.dtype == value.dtype
         and old.device == value.device
     ):
         old.copy_(value)
         return old
-    setattr(module, attr, value)
+    if name in module.__dict__:
+        # A plain attribute set before the buffer existed (e.g. the quantized
+        # path assigns None in __init__) blocks register_buffer; drop it.
+        delattr(module, name)
+    module.register_buffer(name, value, persistent=False)
     return value
 
 

@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import refreshes_derived_state_on_reload
 
 from .meta import (
     SKIP_LOAD_TENSORS,
@@ -282,6 +283,14 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+
+    # Now that the module tree holds the reloaded tensors, let a model rebuild
+    # any state it derives from its weights. Buffers that receive no checkpoint
+    # tensor (fused stacks read through captured-graph addresses) were restored
+    # to their pre-reload values above; rebuilding here refreshes them in place.
+    for layer in model.modules():
+        if refreshes_derived_state_on_reload(layer):
+            layer.reload_derived_state()
 
 
 def finalize_layerwise_reload(*args, **kwargs):

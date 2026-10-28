@@ -1761,6 +1761,31 @@ class SupportsEagle3(SupportsEagleBase, Protocol):
         return (2, num_layers // 2, num_layers - 3)
 
 
+@runtime_checkable
+class RefreshesDerivedStateOnReload(Protocol):
+    """A model whose state is derived from weights and rebuilt after a reload.
+
+    Some models stack per-layer weights into fused buffers that are read through
+    addresses baked into captured CUDA graphs. Those buffers are registered
+    non-persistently, so the layerwise reload preserves their storage but not
+    their contents: they receive no checkpoint tensors, so finalization puts the
+    pre-reload values back. A model that derives such state implements this hook
+    to rebuild it once the reload has finished, writing the loaded values into
+    the storage the graphs already point at.
+    """
+
+    def reload_derived_state(self) -> None:
+        """Rebuild state derived from the model's weights after a reload."""
+        ...
+
+
+def refreshes_derived_state_on_reload(
+    model: object,
+) -> TypeIs[RefreshesDerivedStateOnReload]:
+    """Whether ``model`` rebuilds derived state after a weight reload."""
+    return callable(getattr(model, "reload_derived_state", None))
+
+
 @overload
 def supports_eagle3(model: type[object]) -> TypeIs[type[SupportsEagle3]]: ...
 

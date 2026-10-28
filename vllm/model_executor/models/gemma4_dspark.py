@@ -19,7 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload.utils import adopt_fused_tensor
+from vllm.model_executor.model_loader.reload.utils import register_fused_buffer
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
@@ -228,20 +228,20 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self, layers_attn: list[nn.Module], has_bias: bool
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
-        self._fused_k_weight = adopt_fused_tensor(
+        self._fused_k_weight = register_fused_buffer(
             self,
             "_fused_k_weight",
             torch.cat([a.k_proj.weight for a in layers_attn], dim=0),
         )
         if has_bias:
-            self._fused_k_bias: torch.Tensor | None = adopt_fused_tensor(
+            self._fused_k_bias: torch.Tensor | None = register_fused_buffer(
                 self,
                 "_fused_k_bias",
                 torch.cat([a.k_proj.bias for a in layers_attn], dim=0),
             )
         else:
             self._fused_k_bias = None
-        self._k_norm_weights = adopt_fused_tensor(
+        self._k_norm_weights = register_fused_buffer(
             self,
             "_k_norm_weights",
             torch.stack(
@@ -249,7 +249,7 @@ class Gemma4DSparkModel(DFlashQwen3Model):
             ).contiguous(),
         )
         # v_norm has no learnable scale; ones matching the K-norm call shape.
-        self._v_norm_weights = adopt_fused_tensor(
+        self._v_norm_weights = register_fused_buffer(
             self,
             "_v_norm_weights",
             torch.ones(

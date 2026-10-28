@@ -36,7 +36,10 @@ from vllm.model_executor.model_loader.reload.meta import (
     to_meta_tensor,
 )
 from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
-from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
+from vllm.model_executor.model_loader.reload.utils import (
+    get_layer_tensors,
+    register_fused_buffer,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader,
     default_weight_loader,
@@ -1151,6 +1154,157 @@ def test_layerwise_reload_updates_loaded_non_persistent_buffers(monkeypatch):
     assert torch.equal(layer.scale, loaded_scale)
     assert "scale" in layer._non_persistent_buffers_set
     assert "0.scale" not in model.state_dict()
+
+
+def test_register_fused_buffer_keeps_storage_and_registration():
+    """A fused buffer is registered non-persistently and adopted in place.
+
+    Drafters stack per-layer weights into fused buffers whose addresses are
+    baked into captured CUDA graphs. Re-registering would replace the storage
+    and leave the graph reading freed memory, so a rebuild must copy into the
+    existing tensor instead.
+    """
+    module = torch.nn.Module()
+    module.register_parameter("weight", torch.nn.Parameter(torch.zeros(4, 4)))
+
+    first = torch.ones(4, 4)
+    register_fused_buffer(module, "_fused", first)
+
+    assert module._fused is first
+    assert "_fused" in module._non_persistent_buffers_set
+    # Derived state must not appear in the state dict.
+    assert "_fused" not in module.state_dict()
+
+    address = module._fused.data_ptr()
+    second = torch.full((4, 4), 2.0)
+    register_fused_buffer(module, "_fused", second)
+
+    # Adopted in place: same storage, new values, still registered.
+    assert module._fused.data_ptr() == address
+    assert torch.equal(module._fused, second)
+    assert "_fused" in module._non_persistent_buffers_set
+
+
+def test_register_fused_buffer_reallocates_on_shape_change():
+    """A shape change cannot be copied in place, so the buffer is re-registered."""
+    module = torch.nn.Module()
+    register_fused_buffer(module, "_fused", torch.ones(2, 2))
+    address = module._fused.data_ptr()
+
+    register_fused_buffer(module, "_fused", torch.ones(3, 3))
+
+    assert module._fused.shape == (3, 3)
+    assert module._fused.data_ptr() != address
+    assert "_fused" in module._non_persistent_buffers_set
+
+
+def test_register_fused_buffer_replaces_plain_attribute():
+    """A plain attribute from an earlier build must not block registration.
+
+    The quantized path assigns ``None`` in ``__init__``, before the fused
+    builder runs during ``load_weights``.
+    """
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.zeros(2, 2))
+    module._fused = None
+
+    register_fused_buffer(module, "_fused", torch.ones(2, 2))
+
+    assert torch.equal(module._fused, torch.ones(2, 2))
+    assert "_fused" in module._non_persistent_buffers_set
+    assert "_fused" not in module.state_dict()
+
+
+def test_register_fused_buffer_reallocates_over_meta_buffer():
+    """Mid-reload the builder sees a meta-derived buffer; copy_ is impossible."""
+    module = torch.nn.Module()
+    module.register_buffer("_fused", torch.empty(2, 2, device="meta"), persistent=False)
+
+    register_fused_buffer(module, "_fused", torch.ones(2, 2))
+
+    assert not module._fused.is_meta
+    assert torch.equal(module._fused, torch.ones(2, 2))
+    assert "_fused" in module._non_persistent_buffers_set
+
+
+def test_finalize_layerwise_reload_calls_derived_state_hook(monkeypatch):
+    """A model deriving state from its weights rebuilds it after finalization.
+
+    Fused buffers registered non-persistently keep their storage across a
+    reload but receive no checkpoint tensors, so finalization restores their
+    pre-reload values. The hook is the model's chance to refresh them in place.
+    """
+    calls = []
+
+    class _Derived(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+
+        def reload_derived_state(self) -> None:
+            calls.append("rebuilt")
+
+    class _Outer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Derived()
+
+    model = _Outer()
+
+    def materialize_with_sentinel(meta_tensor):
+        tensor = torch.empty_strided(
+            size=tuple(meta_tensor.size()),
+            stride=tuple(meta_tensor.stride()),
+            dtype=meta_tensor.dtype,
+            requires_grad=False,
+        )
+        tensor.fill_(-123.0)
+        tensor.__class__ = meta_tensor.__class__
+        tensor.__dict__ = meta_tensor.__dict__.copy()
+        return tensor
+
+    monkeypatch.setattr(
+        reload_meta, "materialize_meta_tensor", materialize_with_sentinel
+    )
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    assert calls == [], "hook must not run until finalization"
+
+    finalize_layerwise_reload(model, model_config=None)
+
+    # Reached through the nested module, exactly once.
+    assert calls == ["rebuilt"]
+
+
+def test_finalize_layerwise_reload_without_derived_state_hook(monkeypatch):
+    """Models without the hook reload unchanged."""
+    layer = _NonPersistentBufferLayer()
+    model = torch.nn.Sequential(layer)
+    loaded_weight = torch.full_like(layer.weight, 7.0)
+
+    def materialize_with_sentinel(meta_tensor):
+        tensor = torch.empty_strided(
+            size=tuple(meta_tensor.size()),
+            stride=tuple(meta_tensor.stride()),
+            dtype=meta_tensor.dtype,
+            requires_grad=False,
+        )
+        tensor.fill_(-123.0)
+        tensor.__class__ = meta_tensor.__class__
+        tensor.__dict__ = meta_tensor.__dict__.copy()
+        return tensor
+
+    monkeypatch.setattr(
+        reload_meta, "materialize_meta_tensor", materialize_with_sentinel
+    )
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.equal(layer.weight, loaded_weight)
 
 
 @pytest.fixture

@@ -32,7 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload.utils import adopt_fused_tensor
+from vllm.model_executor.model_loader.reload.utils import register_fused_buffer
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -534,12 +534,12 @@ class DFlashQwen3Model(nn.Module):
         ):
             # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
             kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-            self._fused_kv_weight: torch.Tensor | None = adopt_fused_tensor(
+            self._fused_kv_weight: torch.Tensor | None = register_fused_buffer(
                 self, "_fused_kv_weight", torch.cat(kv_weights, dim=0)
             )
             if has_bias:
                 kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-                self._fused_kv_bias: torch.Tensor | None = adopt_fused_tensor(
+                self._fused_kv_bias: torch.Tensor | None = register_fused_buffer(
                     self, "_fused_kv_bias", torch.cat(kv_biases, dim=0)
                 )
             else:
@@ -552,13 +552,27 @@ class DFlashQwen3Model(nn.Module):
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
-        self._k_norm_weights = adopt_fused_tensor(
+        self._k_norm_weights = register_fused_buffer(
             self,
             "_k_norm_weights",
             torch.stack(
                 [a.k_norm.weight.data for a in layers_attn], dim=0
             ).contiguous(),
         )
+
+    def reload_derived_state(self) -> None:
+        """Rebuild the fused buffers from the reloaded layer weights.
+
+        The fused buffers are registered non-persistently so the layerwise
+        reload keeps their storage, which is what the captured CUDA graphs
+        point at. They receive no checkpoint tensors, so finalization restores
+        their pre-reload values instead of refreshing them; rebuilding here
+        copies the loaded weights into that same storage.
+        """
+        if not hasattr(self, "_num_attn_layers"):
+            # Never built (dummy weights, or a partially constructed model).
+            return
+        self._build_fused_kv_buffers()
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.

@@ -740,10 +740,16 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
             )
         ),
     ]
-    model = SimpleNamespace(
-        hidden_norm=SimpleNamespace(weight=nn.Parameter(torch.ones(2))),
-        _rms_norm_eps=1e-6,
-    )
+
+    class Host(nn.Module):
+        """Minimal host so the fused buffers register as real buffers."""
+
+        def __init__(self):
+            super().__init__()
+            self.hidden_norm = SimpleNamespace(weight=nn.Parameter(torch.ones(2)))
+            self._rms_norm_eps = 1e-6
+
+    model = Host()
     layers_attn = [
         SimpleNamespace(
             qkv_proj=projection,
@@ -758,6 +764,11 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
         has_bias=False,
     )
     assert model._fused_kv_weight is None
+    # The quantized fallback leaves no fused KV weight to register, but the
+    # K-norm stack is always a (non-persistent) registered buffer.
+    assert model._k_norm_weights.shape == (2, 2)
+    assert "_k_norm_weights" in model._non_persistent_buffers_set
+    assert "_fused_kv_weight" not in model._buffers
     assert all(not hasattr(projection, "weight") for projection in projections)
 
     actual_k, actual_v = qwen3_dflash.DFlashQwen3Model._project_context_kv(

@@ -23,7 +23,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload.utils import adopt_fused_tensor
+from vllm.model_executor.model_loader.reload.utils import register_fused_buffer
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -158,7 +158,7 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        self._kv_weights = adopt_fused_tensor(
+        self._kv_weights = register_fused_buffer(
             self,
             "_kv_weights",
             torch.stack(
@@ -166,7 +166,7 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
             ).contiguous(),
         )
         if has_bias:
-            self._kv_biases: torch.Tensor | None = adopt_fused_tensor(
+            self._kv_biases: torch.Tensor | None = register_fused_buffer(
                 self,
                 "_kv_biases",
                 torch.stack(
@@ -175,14 +175,14 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
             )
         else:
             self._kv_biases = None
-        self._input_layernorm_weights = adopt_fused_tensor(
+        self._input_layernorm_weights = register_fused_buffer(
             self,
             "_input_layernorm_weights",
             torch.stack(
                 [layer.input_layernorm.weight.data for layer in self.layers], dim=0
             ).contiguous(),
         )
-        self._k_norm_weights = adopt_fused_tensor(
+        self._k_norm_weights = register_fused_buffer(
             self,
             "_k_norm_weights",
             torch.stack(
