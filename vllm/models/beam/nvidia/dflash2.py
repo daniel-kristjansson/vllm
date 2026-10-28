@@ -38,7 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload.utils import adopt_fused_tensor
+from vllm.model_executor.model_loader.reload.utils import register_fused_buffer
 from vllm.model_executor.models.qwen3_dflash2 import DFlashGroupedConv
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -380,6 +380,11 @@ class DFlash2BeamModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def reload_derived_state(self) -> None:
+        """Rebuild the fused context K/V weights after a weight reload."""
+        if hasattr(self, "_context_kv_weight"):
+            self.build_context_kv_weights()
+
     def build_context_kv_weights(self) -> None:
         """Stack every layer's K/V projection and K-norm weight.
 
@@ -387,12 +392,12 @@ class DFlash2BeamModel(nn.Module):
         norm. Must run after the weights are loaded, since it copies them.
         """
         attns = [layer.self_attn for layer in self.layers]
-        self._context_kv_weight = adopt_fused_tensor(
+        self._context_kv_weight = register_fused_buffer(
             self,
             "_context_kv_weight",
             torch.cat([attn.qkv_proj.weight[attn.q_size :] for attn in attns]),
         )
-        self._context_k_norm_weight = adopt_fused_tensor(
+        self._context_k_norm_weight = register_fused_buffer(
             self,
             "_context_k_norm_weight",
             torch.stack([attn.k_norm.weight for attn in attns]).contiguous(),
